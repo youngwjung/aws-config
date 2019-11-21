@@ -1,0 +1,569 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS Config CloudFormation Template
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Parameters:
+          - Project
+          - EmailAddress
+          - ConfigFrequency
+
+    ParameterLabels:
+      Project:
+        default: Project Name
+      EmailAddress:
+        default: Email Address
+      ConfigFrequency:
+        default: Config Evaluation interval
+
+# Custom Variable for the environment
+Parameters:
+  Project:
+    Description: Name of the Project
+    Type: String
+    MinLength: 1
+    ConstraintDescription: This parameter is required.
+
+  EmailAddress:
+    Description: Email address to get notifications
+    Type: String
+    MinLength: 1
+    ConstraintDescription: This parameter is required.
+
+  ConfigFrequency:
+    Description: The frequency that you want AWS Config to run evaluations for rules.
+    Type: String
+    Default: TwentyFour_Hours
+    MinLength: 1
+    ConstraintDescription: This parameter is required.
+    AllowedValues:
+      - One_Hour
+      - Three_Hours
+      - Six_Hours
+      - Twelve_Hours
+      - TwentyFour_Hours
+
+Resources:
+  ConfigurationRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+      RoleARN: !GetAtt ConfigRole.Arn
+
+  DeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: !Ref ConfigFrequency
+      S3BucketName: !Ref ConfigBucket
+      # SnsTopicARN: !Ref SNSTopic
+
+  # S3 Bucket to store media files
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join ['-', [!Ref Project, "aws-config"]]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          -
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+
+  # IAM Policy to give access to S3 bucket
+  IAMS3Policy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Join ['-', [!Ref Project, "aws-config-access"]]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Action:
+              - s3:DeleteObject
+              - s3:Get*
+              - s3:List*
+              - s3:PutObject
+            Resource:
+              - !Join ['', ['arn:aws:s3:::', !Ref 'ConfigBucket']]
+              - !Join ['', ['arn:aws:s3:::', !Ref 'ConfigBucket', /*]]
+      Roles:
+        - !Ref ConfigRole
+    DependsOn:
+      - ConfigBucket
+      - ConfigRole
+
+  ConfigEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Change in AWS Config Compliant
+      EventPattern:
+        source:
+          - aws.config
+        detail-type:
+          - Config Rules Compliance Change
+      Targets:
+        -
+          Arn: !Ref SNSTopic
+          Id: "ConfigSNSTopic"
+
+  # IAM Policy to give access to S3 bucket
+  IAMSNSPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Join ['-', [!Ref Project, "sns-access"]]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Action:
+              - sns:Publish
+            Resource:
+              - !Ref SNSTopic
+      Roles:
+        - !Ref ConfigRole
+    DependsOn:
+      - SNSTopic
+      - ConfigRole
+
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - sns:Publish
+            Resource: '*'
+      Topics:
+        - !Ref SNSTopic
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Join ['-', [!Ref Project, "aws-config-notification"]]
+      Subscription:
+        -
+          Endpoint: !Ref EmailAddress
+          Protocol: email
+
+  ConfigRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - config.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRole
+
+  AccessKeysRotatedRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: access-keys-rotated
+      Description: Checks whether the active access keys are rotated within the number of days specified in maxAccessKeyAge. The rule is non-compliant if the access keys have not been rotated for more than maxAccessKeyAge number of days.
+      InputParameters:
+        maxAccessKeyAge: 90
+      MaximumExecutionFrequency: !Ref ConfigFrequency
+      Source:
+        Owner: AWS
+        SourceIdentifier: ACCESS_KEYS_ROTATED
+    DependsOn:
+      - ConfigurationRecorder
+
+  ACMCertificateExpirationCheckRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: acm-certificate-expiration-check
+      Description: Checks whether ACM Certificates in your account are marked for expiration within the specified number of days. Certificates provided by ACM are automatically renewed. ACM does not automatically renew certificates that you import.
+      InputParameters:
+        daysToExpiration: 30
+      MaximumExecutionFrequency: !Ref ConfigFrequency
+      Source:
+        Owner: AWS
+        SourceIdentifier: ACM_CERTIFICATE_EXPIRATION_CHECK
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::ACM::Certificate
+    DependsOn:
+      - ConfigurationRecorder
+
+  ASGELBHealthcheckRequiredRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: autoscaling-group-elb-healthcheck-required
+      Description: Checks whether your Auto Scaling groups that are associated with a load balancer are using Elastic Load Balancing health checks.
+      Source:
+        Owner: AWS
+        SourceIdentifier: AUTOSCALING_GROUP_ELB_HEALTHCHECK_REQUIRED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - ConfigurationRecorder
+
+  CloudTrailEnabledRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: cloudtrail-enabled
+      Description: Checks whether AWS CloudTrail is enabled in your AWS account.
+      MaximumExecutionFrequency: !Ref ConfigFrequency
+      Source:
+        Owner: AWS
+        SourceIdentifier: CLOUD_TRAIL_ENABLED
+    DependsOn:
+      - ConfigurationRecorder
+
+  DBInstanceBackupEnabledRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: db-instance-backup-enabled
+      Description: Checks whether RDS DB instances have backups enabled.
+      Source:
+        Owner: AWS
+        SourceIdentifier: DB_INSTANCE_BACKUP_ENABLED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::RDS::DBInstance
+    DependsOn:
+      - ConfigurationRecorder
+
+  DynamoDBAutoscalingEnabledRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: dynamodb-autoscaling-enabled
+      Description: Checks whether Auto Scaling is enabled on your DynamoDB tables.
+      MaximumExecutionFrequency: !Ref ConfigFrequency
+      Source:
+        Owner: AWS
+        SourceIdentifier: DYNAMODB_AUTOSCALING_ENABLED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::DynamoDB::Table
+    DependsOn:
+      - ConfigurationRecorder
+
+  EC2InstanceManagedBySystemsManagerRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: ec2-instance-managed-by-systems-manager
+      Description: Checks whether the Amazon EC2 instances in your account are managed by AWS Systems Manager.
+      Source:
+        Owner: AWS
+        SourceIdentifier: EC2_INSTANCE_MANAGED_BY_SSM
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Instance
+          - AWS::SSM::ManagedInstanceInventory
+    DependsOn:
+      - ConfigurationRecorder
+
+  EC2VolumeInuseCheckRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: ec2-volume-inuse-check
+      Description: Checks whether EBS volumes are attached to EC2 instances.
+      Source:
+        Owner: AWS
+        SourceIdentifier: EC2_VOLUME_INUSE_CHECK
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Volume
+    DependsOn:
+      - ConfigurationRecorder
+
+  EIPAttachedRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: eip-attached
+      Description: Checks whether all EIP addresses allocated to a VPC are attached to EC2 instances or in-use ENIs.
+      Source:
+        Owner: AWS
+        SourceIdentifier: EIP_ATTACHED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::EIP
+    DependsOn:
+      - ConfigurationRecorder
+
+  ELBLoggingEnabledRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: elb-logging-enabled
+      Description: Checks whether the Application Load Balancers and the Classic Load Balancers have logging enabled.
+      Source:
+        Owner: AWS
+        SourceIdentifier: ELB_LOGGING_ENABLED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::ElasticLoadBalancing::LoadBalancer
+          - AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn:
+      - ConfigurationRecorder
+
+  EncryptedVolumesRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: encrypted-volumes
+      Description: Checks whether EBS volumes that are in an attached state are encrypted.
+      Source:
+        Owner: AWS
+        SourceIdentifier: ENCRYPTED_VOLUMES
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Volume
+    DependsOn:
+      - ConfigurationRecorder
+
+  GuardDutyEnabledCentralizedRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: guardduty-enabled-centralized
+      Description: Checks whether GuardDuty is enabled.
+      MaximumExecutionFrequency: !Ref ConfigFrequency
+      Source:
+        Owner: AWS
+        SourceIdentifier: GUARDDUTY_ENABLED_CENTRALIZED
+    DependsOn:
+      - ConfigurationRecorder
+
+  IAMPasswordPolicyRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: iam-password-policy
+      Description: Checks whether the account password policy for IAM users meets the specified requirements.
+      InputParameters:
+        RequireUppercaseCharacters: true
+        RequireLowercaseCharacters: true
+        RequireSymbols: true
+        RequireNumbers: true
+        MinimumPasswordLength: 10
+        PasswordReusePrevention: 3
+        MaxPasswordAge: 90
+      MaximumExecutionFrequency: !Ref ConfigFrequency
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_PASSWORD_POLICY
+    DependsOn:
+      - ConfigurationRecorder
+
+  IAMPolicyNoStatementsWithAdminAccessRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: iam-policy-no-statements-with-admin-access
+      Description: Checks whether the default version of AWS Identity and Access Management (IAM) policies do not have administrator access.
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_POLICY_NO_STATEMENTS_WITH_ADMIN_ACCESS
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::IAM::Policy
+    DependsOn:
+      - ConfigurationRecorder
+
+  IAMRoleManagedPolicyCheckRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: iam-role-managed-policy-check
+      Description: Checks that the AWS Identity and Access Management (IAM) role is attached to all AWS managed policies specified in the list of managed policies.
+      InputParameters:
+        managedPolicyArns: arn:aws:iam::aws:policy/AdministratorAccess
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_ROLE_MANAGED_POLICY_CHECK
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::IAM::Role
+    DependsOn:
+      - ConfigurationRecorder
+
+  IAMRootAccessKeyCheckRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: iam-root-access-key-check
+      Description: Checks whether the root user access key is available. The rule is compliant if the user access key does not exist.
+      MaximumExecutionFrequency: !Ref ConfigFrequency
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_ROOT_ACCESS_KEY_CHECK
+    DependsOn:
+      - ConfigurationRecorder
+
+  IAMUserMFAEnabledRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: iam-user-mfa-enabled
+      Description: Checks whether the AWS Identity and Access Management users have multi-factor authentication (MFA) enabled.
+      MaximumExecutionFrequency: !Ref ConfigFrequency
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_USER_MFA_ENABLED
+    DependsOn:
+      - ConfigurationRecorder
+
+  IAMUserMFAEnabledRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: iam-user-mfa-enabled
+      Description: Checks whether the AWS Identity and Access Management users have multi-factor authentication (MFA) enabled.
+      MaximumExecutionFrequency: !Ref ConfigFrequency
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_USER_MFA_ENABLED
+    DependsOn:
+      - ConfigurationRecorder
+
+  RestrictedSSHRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: restricted-ssh
+      Description: Checks whether security groups that are in use disallow unrestricted incoming SSH traffic.
+      Source:
+        Owner: AWS
+        SourceIdentifier: INCOMING_SSH_DISABLED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::SecurityGroup
+    DependsOn:
+      - ConfigurationRecorder
+
+  RDSInstancePublicAccessCheckRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: rds-instance-public-access-check
+      Description: Checks whether the Amazon Relational Database Service (RDS) instances are not publicly accessible. The rule is non-compliant if the publiclyAccessible field is true in the instance configuration item.
+      Source:
+        Owner: AWS
+        SourceIdentifier: RDS_INSTANCE_PUBLIC_ACCESS_CHECK
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::RDS::DBInstance
+    DependsOn:
+      - ConfigurationRecorder
+
+  RDSMultiAZSupportRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: rds-multi-az-support
+      Description: Checks whether high availability is enabled for your RDS DB instances.
+      Source:
+        Owner: AWS
+        SourceIdentifier: RDS_MULTI_AZ_SUPPORT
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::RDS::DBInstance
+    DependsOn:
+      - ConfigurationRecorder
+
+  RDSStorageEncryptedRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: rds-storage-encrypted
+      Description: Checks whether storage encryption is enabled for your RDS DB instances.
+      Source:
+        Owner: AWS
+        SourceIdentifier: RDS_STORAGE_ENCRYPTED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::RDS::DBInstance
+    DependsOn:
+      - ConfigurationRecorder
+
+  RootAccountMFAEnabledRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: root-account-mfa-enabled
+      Description: Checks whether the root user of your AWS account requires multi-factor authentication for console sign-in.
+      MaximumExecutionFrequency: !Ref ConfigFrequency
+      Source:
+        Owner: AWS
+        SourceIdentifier: ROOT_ACCOUNT_MFA_ENABLED
+    DependsOn:
+      - ConfigurationRecorder
+
+  S3BucketPublicReadProhibitedRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: s3-bucket-public-read-prohibited
+      Description: Checks that your Amazon S3 buckets do not allow public read access. The rule checks the Block Public Access settings, the bucket policy, and the bucket access control list (ACL).
+      MaximumExecutionFrequency: !Ref ConfigFrequency
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_PUBLIC_READ_PROHIBITED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::S3::Bucket
+    DependsOn:
+      - ConfigurationRecorder
+
+  S3BucketPublicWriteProhibitedRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: s3-bucket-public-write-prohibited
+      Description: Checks that your Amazon S3 buckets do not allow public write access. The rule checks the Block Public Access settings, the bucket policy, and the bucket access control list (ACL).
+      MaximumExecutionFrequency: !Ref ConfigFrequency
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_PUBLIC_WRITE_PROHIBITED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::S3::Bucket
+    DependsOn:
+      - ConfigurationRecorder
+
+  S3BucketSSEEnabledRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: s3-bucket-server-side-encryption-enabled
+      Description: Checks that your Amazon S3 bucket either has S3 default encryption enabled or that the S3 bucket policy explicitly denies put-object requests without server side encryption.
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::S3::Bucket
+    DependsOn:
+      - ConfigurationRecorder
+
+  S3BucketSSLRequestsOnlyRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: s3-bucket-ssl-requests-only
+      Description: Checks whether S3 buckets have policies that require requests to use Secure Socket Layer (SSL).
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_SSL_REQUESTS_ONLY
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::S3::Bucket
+    DependsOn:
+      - ConfigurationRecorder
+
+  RestrictedIncomingTraffic:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: restricted-common-ports
+      Description: Checks whether security groups that are in use disallow unrestricted incoming TCP traffic to the specified ports.
+      Source:
+        Owner: AWS
+        SourceIdentifier: RESTRICTED_INCOMING_TRAFFIC
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::SecurityGroup
+    DependsOn:
+      - ConfigurationRecorder
