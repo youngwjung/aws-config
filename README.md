@@ -2,6 +2,16 @@
 
 AWS Config는 AWS 리소스 구성을 주기적으로 또는 실시간으로 모니터링 및 기록하여 리소스의 구성변화 감지 및 리소스간의 관계 또는 의존관계 변화를 검토하고 변화된 리소스 구성이 사용자가 미리 지정해 놓은 규칙을 준수하는지 평가하여 규정 준수 감사, 보안 분석 및 변경 관리 작업을 간소화 할수 있습니다
 
+## Lab Overview
+
+1. AWS Config 구성 및 Managed Rule 적용
+
+2. AWS Lambda를 사용해서 Custom rule 생성
+
+3. Noncompliant 리소스들에 대한 Auto Remediation 구성
+
+4. Multi-Account & Multi-Region Data Aggregation
+
 ## Basic Configuration
 
 1. AWS Management Console 좌측 상단에 있는 **[Services]** 를 선택하고 검색창에서 Config을 검색하거나 Management & Governance 밑에 있는 **[Config]** 를 선택 후 **[Get started]**
